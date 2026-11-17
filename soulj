@@ -1,0 +1,257 @@
+
+import os
+import re
+import sys
+import base64
+import binascii
+import zipfile
+import requests
+import html
+from pathlib import Path
+from urllib.parse import unquote, urlparse
+from io import BytesIO
+
+try:
+    from PIL import Image
+    from PIL.ExifTags import TAGS
+except ImportError:
+    Image = None
+
+FLAG = re.compile(
+    r"cybersurferCTF\{[^{}\r\n]{1,300}\}",
+    re.IGNORECASE
+)
+
+found = set()
+MAX_SIZE = 10 * 1024 * 1024
+MAX_DEPTH = 4
+
+def report(text, source):
+    for match in FLAG.findall(text):
+        if match not in found:
+            found.add(match)
+            print("\n[+] FLAG FOUND:", match)
+            print("[+] SOURCE:", source)
+
+def decode_text(data):
+    results = []
+
+    try:
+        text = data.decode("utf-8")
+        results.append(text)
+    except:
+        text = data.decode("latin-1", errors="ignore")
+        results.append(text)
+
+    # URL decoding
+    results.append(unquote(text))
+
+    # Reversed text
+    results.append(text[::-1])
+
+    # Base64 detection
+    candidates = re.findall(
+        r"[A-Za-z0-9+/]{12,}={0,2}", text
+    )
+
+    for item in candidates:
+        try:
+            decoded = base64.b64decode(
+                item + "=" * (-len(item) % 4),
+                validate=True
+            )
+            results.append(decoded.decode("utf-8"))
+        except:
+            pass
+
+    # Hexadecimal detection
+    hex_candidates = re.findall(
+        r"(?<![0-9a-fA-F])[0-9a-fA-F]{16,}(?![0-9a-fA-F])",
+        text
+    )
+
+    for item in hex_candidates:
+        if len(item) % 2 == 0:
+            try:
+                results.append(
+                    bytes.fromhex(item).decode("utf-8")
+                )
+            except:
+                pass
+
+    return results
+
+def scan_data(data, source, depth=0):
+    if depth > MAX_DEPTH:
+        return
+
+    try:
+        text = data.decode("utf-8", errors="ignore")
+    except:
+        return
+
+    report(text, source)
+
+    for decoded in decode_text(data):
+        report(decoded, source + " [decoded]")
+
+        if decoded != text:
+            scan_data(
+                decoded.encode("utf-8"),
+                source + " [nested decode]",
+                depth + 1
+            )
+
+def scan_file(path):
+    print("\n[*] Scanning:", path)
+
+    try:
+        if path.stat().st_size > MAX_SIZE:
+            print("[-] File too large, skipped")
+            return
+
+        data = path.read_bytes()
+        scan_data(data, str(path))
+
+        # ZIP inspection
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as archive:
+                for item in archive.infolist():
+                    if item.file_size > MAX_SIZE:
+                        continue
+
+                    if not item.is_dir():
+                        content = archive.read(item)
+                        scan_data(
+                            content,
+                            str(path) + "/" + item.filename
+                        )
+
+        # Image metadata
+        if Image:
+            try:
+                img = Image.open(BytesIO(data))
+
+                print("[+] IMAGE:", img.format)
+                print("[+] SIZE:", img.size)
+
+                metadata = img.getexif()
+
+                for tag, value in metadata.items():
+                    name = TAGS.get(tag, str(tag))
+                    print(f"[META] {name}: {value}")
+
+                    scan_data(
+                        str(value).encode(),
+                        str(path) + " metadata"
+                    )
+
+                # PNG and other textual metadata
+                for key, value in img.info.items():
+                    print(f"[META] {key}: {value}")
+                    scan_data(
+                        str(value).encode(),
+                        str(path) + " image info"
+                    )
+
+            except Exception:
+                pass
+
+    except Exception as error:
+        print("[-] Error:", error)
+
+def scan_folder(folder):
+    print("\n[*] Scanning folder:", folder)
+
+    for root, dirs, files in os.walk(folder):
+        for name in files:
+            scan_file(Path(root) / name)
+
+def scan_web(url):
+    print("\n[*] Scanning website:", url)
+
+    try:
+        parsed = urlparse(url)
+
+        if parsed.scheme not in ("http", "https"):
+            print("[-] Invalid URL")
+            return
+
+        response = requests.get(
+            url,
+            timeout=15,
+            headers={"User-Agent": "CTF-FlagFinder/1.0"}
+        )
+
+        print("[+] HTTP STATUS:", response.status_code)
+        print("[+] FINAL URL:", response.url)
+
+        scan_data(
+            response.content,
+            "Website: " + url
+        )
+
+        # Search visible HTML text and encoded strings
+        scan_data(
+            html.unescape(response.text).encode(),
+            "Website HTML: " + url
+        )
+
+    except Exception as error:
+        print("[-] Website error:", error)
+
+def main():
+    while True:
+        print("""
+=================================
+       CTF FLAG FINDER
+=================================
+1. Scan a file
+2. Scan a folder
+3. Scan an image and metadata
+4. Scan a website
+5. Exit
+=================================
+""")
+
+        choice = input("Choose: ").strip()
+
+        if choice == "1":
+            path = Path(input("File path: ").strip())
+            if path.is_file():
+                scan_file(path)
+            else:
+                print("[-] File not found")
+
+        elif choice == "2":
+            folder = Path(input("Folder path: ").strip())
+            if folder.is_dir():
+                scan_folder(folder)
+            else:
+                print("[-] Folder not found")
+
+        elif choice == "3":
+            path = Path(input("Image path: ").strip())
+            if path.is_file():
+                scan_file(path)
+            else:
+                print("[-] Image not found")
+
+        elif choice == "4":
+            url = input("CTF challenge URL: ").strip()
+            scan_web(url)
+
+        elif choice == "5":
+            print("Exiting Flag Finder...")
+            break
+
+        else:
+            print("[-] Invalid choice")
+
+        if found:
+            print("\n[+] TOTAL UNIQUE FLAGS:", len(found))
+        else:
+            print("\n[-] No matching flag found yet.")
+
+if __name__ == "__main__":
+    main()
